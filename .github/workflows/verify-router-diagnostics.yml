@@ -1,0 +1,125 @@
+# Throwaway verification workflow for the fix/router-diagnostics-metrics PR.
+# Lives only on the ci/verify-router-diagnostics branch of the fork; never part of the PR.
+name: verify-router-diagnostics
+on:
+  push:
+    branches:
+      - ci/verify-router-diagnostics
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  failing-then-passing:
+    name: TestTrackFailureMetrics fails on the old guard and passes on the fix
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: 'go.mod'
+      - name: Put the old guard back (test must fail)
+        run: |
+          sed -i 's/failuresMetric\[event]; !ok {/failuresMetric[event][errorResponse]; !ok {/' router/handle_observability.go
+          if git diff --quiet; then
+            echo "::error::sed did not reintroduce the old guard"
+            exit 1
+          fi
+          git --no-pager diff
+          if go test -count=1 -v -run '^TestTrackFailureMetrics$' ./router/; then
+            echo "::error::TestTrackFailureMetrics passed against the old guard"
+            exit 1
+          fi
+          echo "TestTrackFailureMetrics failed against the old guard, as expected"
+      - name: Restore the fix (tests must pass with -race)
+        run: |
+          git checkout -- router/handle_observability.go
+          go test -count=1 -race -v -run '^(TestTrackFailureMetrics|TestTakeRequestMetrics|TestUpdateRudderSourcesStats_.*)$' ./router/
+
+  generate:
+    name: go mod tidy, make mocks and make fmt leave no diff (as in verify.yml)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: 'go.mod'
+      - run: go mod tidy
+      - run: git diff --exit-code go.mod
+      - run: make mocks
+      - run: git diff --exit-code
+      - run: make fmt
+      - run: git diff --exit-code
+
+  lint:
+    name: golangci-lint (as in verify.yml)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: 'go.mod'
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          version: v2.13.2
+          args: -v
+
+  router-unit:
+    name: make test package=router (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: this branch
+            ref: ''
+          - name: upstream master baseline
+            ref: 80353d18b25c4b58c874833a8c2e6ec508f5c073
+    env:
+      GOTESTSUM_JSONFILE: /tmp/gotestsum.json
+    steps:
+      - name: Disable IPv6 (as in tests.yaml)
+        run: |
+          sudo sysctl -w net.ipv6.conf.all.disable_ipv6=1
+          sudo sysctl -w net.ipv6.conf.default.disable_ipv6=1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ matrix.ref }}
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: 'go.mod'
+          cache: false
+      - run: go version
+      - run: go mod download
+      - name: Package Unit [ router ]
+        env:
+          RSERVER_PROCESSOR_ENABLE_CONCURRENT_STORE: "true"
+          RACE_ENABLED: "false"
+          # FORCE_RUN_INTEGRATION_TESTS is left unset: the fork has none of the CI
+          # secrets, so credential-only tests skip instead of failing.
+        run: make test exclude="router/batchrouter/asyncdestinationmanager/bing-ads" package=router
+      - name: Per-test results
+        if: always()
+        run: |
+          if [ ! -s "$GOTESTSUM_JSONFILE" ]; then
+            echo "no gotestsum json file"
+            exit 0
+          fi
+          jq -r 'select(.Test != null and (.Action == "pass" or .Action == "fail" or .Action == "skip")) | "RESULT \(.Action) \(.Package) \(.Test)"' "$GOTESTSUM_JSONFILE" | sort > results.txt
+          echo "=== counts ==="
+          awk '{print $2}' results.txt | sort | uniq -c
+          echo "=== results ==="
+          cat results.txt
+      - name: Coverage of the touched code
+        if: always()
+        run: |
+          if [ ! -f coverage.txt ]; then
+            echo "no coverage.txt produced"
+            exit 0
+          fi
+          go tool cover -func=coverage.txt \
+            | grep -E 'router/handle_observability\.go:|router/handle\.go:.*commitStatusList' \
+            || echo "no matching lines in the coverage profile"
